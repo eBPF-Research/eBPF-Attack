@@ -1,7 +1,7 @@
 # Universal Container Escape with eBPF
 
 ## Attack Requirements
-Enabling eBPF inside a contianer. This needs to run docker with the following flag:  
+Enabling eBPF inside a contianer. This needs to run docker with one of the following flag:  
 - `--cap-add SYS_ADMIN`
 - `--privileged`
 - `-v /var/run/docker.sock:/var/run/docker.sock`  
