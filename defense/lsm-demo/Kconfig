@@ -1,0 +1,6 @@
+config     SECURITY_DEMO
+   bool     "demo support"
+   depends on SECURITY
+   default     n
+   help
+        introduction of demo modules

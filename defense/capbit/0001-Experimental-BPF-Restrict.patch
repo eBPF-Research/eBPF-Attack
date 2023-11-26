@@ -1,0 +1,609 @@
+From 4deeb1136c07ef63b728231e3df132f11e581a64 Mon Sep 17 00:00:00 2001
+From: kitaharazy <2918988144@qq.com>
+Date: Fri, 24 Nov 2023 07:17:32 +0800
+Subject: [PATCH] Experimental: BPF Restrict
+
+---
+ arch/x86/kernel/cpu/common.c |   9 +--
+ include/linux/bpf.h          |  44 +++++++++++++-
+ include/linux/bpf_trace.h    |   2 -
+ include/linux/kernel.h       |  11 ++++
+ include/linux/sched.h        |   5 +-
+ include/uapi/linux/bpf.h     |   4 ++
+ include/uapi/linux/sched.h   |   4 ++
+ kernel/bpf/Kconfig           |  12 ++++
+ kernel/bpf/syscall.c         | 109 +++++++++++++++++++++++++++++++++--
+ kernel/fork.c                |  23 +++++---
+ kernel/trace/bpf_trace.c     |  52 ++++++++++++++++-
+ 11 files changed, 250 insertions(+), 25 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/common.c b/arch/x86/kernel/cpu/common.c
+index 3e508f239..ee7339833 100644
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@ -420,20 +420,21 @@ static unsigned long cr4_pinned_bits __ro_after_init;
+ 
+ void native_write_cr0(unsigned long val)
+ {
+-	unsigned long bits_missing = 0;
++//	unsigned long bits_missing = 0;
+ 
+-set_register:
++//set_register:
+ 	asm volatile("mov %0,%%cr0": "+r" (val) : : "memory");
+-
++/*
+ 	if (static_branch_likely(&cr_pinning)) {
+ 		if (unlikely((val & X86_CR0_WP) != X86_CR0_WP)) {
+ 			bits_missing = X86_CR0_WP;
+ 			val |= bits_missing;
+ 			goto set_register;
+ 		}
+-		/* Warn after we've set the missing bits. */
++		// Warn after we've set the missing bits.
+ 		WARN_ONCE(bits_missing, "CR0 WP bit went missing!?\n");
+ 	}
++*/
+ }
+ EXPORT_SYMBOL(native_write_cr0);
+ 
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index c1bd1bd10..38d0052c1 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -28,7 +28,30 @@
+ #include <linux/btf.h>
+ #include <linux/rcupdate_trace.h>
+ #include <linux/static_call.h>
++#ifdef CONFIG_BPF_HELPER_STRICT
++    #include <linux/pid_namespace.h>
++/*
++static unsigned long get_mytime(void) {
++        unsigned long lo, hi;
++        asm( "rdtsc" : "=a" (lo), "=d" (hi) );
++        return( lo | (hi << 32) );
++}
++*/
++
++//    #include <linux/security_bpf_helper.h>
++static bool check_bpf_bitfield(unsigned int flags) {
++    unsigned int bits;
++    int res;
++    bits = current->bpf_helper_bitfield;
++    if (!(bits & (1 << flags))) {
++        res = false;
++    } else {
++	res = true;
++    }
++    return res;
++}
+ 
++#endif
+ struct bpf_verifier_env;
+ struct bpf_verifier_log;
+ struct perf_event;
+@@ -1210,6 +1233,8 @@ struct bpf_prog_aux {
+ 		struct work_struct work;
+ 		struct rcu_head	rcu;
+ 	};
++
++	struct pid_namespace*	load_ns;    // for lsm
+ };
+ 
+ struct bpf_prog {
+@@ -1244,6 +1269,10 @@ struct bpf_prog {
+ 		DECLARE_FLEX_ARRAY(struct sock_filter, insns);
+ 		DECLARE_FLEX_ARRAY(struct bpf_insn, insnsi);
+ 	};
++#ifdef CONFIG_BPF_HELPER_STRICT
++	struct pid_namespace*	load_ns;
++#endif
++
+ };
+ 
+ struct bpf_array_aux {
+@@ -1599,8 +1628,15 @@ bpf_prog_run_array(const struct bpf_prog_array *array,
+ 	const struct bpf_prog *prog;
+ 	struct bpf_run_ctx *old_run_ctx;
+ 	struct bpf_trace_run_ctx run_ctx;
++#ifdef CONFIG_BPF_HELPER_STRICT
++	struct pid_namespace *ns; 
++	bool bit_check;
++#endif
+ 	u32 ret = 1;
+-
++#ifdef CONFIG_BPF_HELPER_STRICT
++	ns = task_active_pid_ns(current);
++	bit_check = (check_bpf_bitfield(BPF_TRACE_NS_ESCAPE_BIT));
++#endif
+ 	RCU_LOCKDEP_WARN(!rcu_read_lock_held(), "no rcu lock held");
+ 
+ 	if (unlikely(!array))
+@@ -1611,7 +1647,12 @@ bpf_prog_run_array(const struct bpf_prog_array *array,
+ 	item = &array->items[0];
+ 	while ((prog = READ_ONCE(item->prog))) {
+ 		run_ctx.bpf_cookie = item->bpf_cookie;
++#ifdef CONFIG_BPF_HELPER_STRICT
++		if (ns == prog->load_ns || bit_check)
++		    ret &= run_prog(prog, ctx);
++#else 
+ 		ret &= run_prog(prog, ctx);
++#endif
+ 		item++;
+ 	}
+ 	bpf_reset_run_ctx(old_run_ctx);
+@@ -2737,4 +2778,5 @@ struct bpf_key {
+ 	bool has_ref;
+ };
+ #endif /* CONFIG_KEYS */
++
+ #endif /* _LINUX_BPF_H */
+diff --git a/include/linux/bpf_trace.h b/include/linux/bpf_trace.h
+index ddf896abc..da6fb68d1 100644
+--- a/include/linux/bpf_trace.h
++++ b/include/linux/bpf_trace.h
+@@ -1,7 +1,5 @@
+ /* SPDX-License-Identifier: GPL-2.0 */
+ #ifndef __LINUX_BPF_TRACE_H__
+ #define __LINUX_BPF_TRACE_H__
+-
+ #include <trace/events/xdp.h>
+-
+ #endif /* __LINUX_BPF_TRACE_H__ */
+diff --git a/include/linux/kernel.h b/include/linux/kernel.h
+index fe6efb24d..f1210cd33 100644
+--- a/include/linux/kernel.h
++++ b/include/linux/kernel.h
+@@ -509,3 +509,14 @@ static inline void ftrace_dump(enum ftrace_dump_mode oops_dump_mode) { }
+ 	 BUILD_BUG_ON_ZERO((perms) & 2) +					\
+ 	 (perms))
+ #endif
++
++#ifdef CONFIG_BPF_HELPER_STRICT
++# define BPF_PROBE_WRITE_BIT 1
++# define BPF_PROBE_READ_BIT  2
++# define BPF_SEND_SIGNAL_BIT 3
++# define BPF_OVERRIDE_RETURN_BIT 4
++# define BPF_GET_MAP_FD_BY_ID_BIT 5
++# define BPF_MAP_ELEM_UPDATE_BIT 6
++# define BPF_PROG_TYPE_BIT 7
++# define BPF_TRACE_NS_ESCAPE_BIT 8
++#endif
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index ffb6eb55c..3e174759a 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -760,7 +760,10 @@ struct task_struct {
+ 	/* Per task flags (PF_*), defined further below: */
+ 	unsigned int			flags;
+ 	unsigned int			ptrace;
+-
++#ifdef CONFIG_BPF_HELPER_STRICT
++	unsigned int			bpf_helper_bitfield;
++	unsigned int			bpf_allow_trace_bitfield;
++#endif 
+ #ifdef CONFIG_SMP
+ 	int				on_cpu;
+ 	struct __call_single_node	wake_entry;
+diff --git a/include/uapi/linux/bpf.h b/include/uapi/linux/bpf.h
+index 51b9aa640..99a90d0f5 100644
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -900,6 +900,7 @@ enum bpf_cmd {
+ 	BPF_ITER_CREATE,
+ 	BPF_LINK_DETACH,
+ 	BPF_PROG_BIND_MAP,
++	BPF_HELPER_BITS_SET,
+ };
+ 
+ enum bpf_map_type {
+@@ -1326,6 +1327,9 @@ union bpf_attr {
+ 		 * to using 5 hash functions).
+ 		 */
+ 		__u64	map_extra;
++#ifdef CONFIG_BPF_HELPER_STRICT
++		__u32 security_helper_bits;
++#endif
+ 	};
+ 
+ 	struct { /* anonymous struct used by BPF_MAP_*_ELEM commands */
+diff --git a/include/uapi/linux/sched.h b/include/uapi/linux/sched.h
+index 3bac0a8ce..c2fd463be 100644
+--- a/include/uapi/linux/sched.h
++++ b/include/uapi/linux/sched.h
+@@ -43,6 +43,10 @@
+  */
+ #define CLONE_NEWTIME	0x00000080	/* New time namespace */
+ 
++#ifdef CONFIG_BPF_HELPER_STRICT
++#define CLONE_BITFIELD	0x00000040	/* set if bpf_helper_bitfield shared between processes */
++#endif
++
+ #ifndef __ASSEMBLY__
+ /**
+  * struct clone_args - arguments for the clone3 syscall
+diff --git a/kernel/bpf/Kconfig b/kernel/bpf/Kconfig
+index 2dfe1079f..a1264b38f 100644
+--- a/kernel/bpf/Kconfig
++++ b/kernel/bpf/Kconfig
+@@ -99,4 +99,16 @@ config BPF_LSM
+ 
+ 	  If you are unsure how to answer this question, answer N.
+ 
++config BPF_HELPER_STRICT
++        bool "Enable BPF HELPER Check bits"
++        depends on BPF_SYSCALL
++        help
++            Enable several check bits for bpf helpers' security improvements.
++
++config BPF_MEASURE_TIME
++	bool "Enable rdtsc to measure extra time"
++	depends on BPF_HELPER_STRICT
++	help
++	    Use rdtsc instruction to measure the extra time introduced by BPF_HELPER_STRICT
++
+ endmenu # "BPF subsystem"
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index 7b373a5e8..de3557b0c 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -35,7 +35,6 @@
+ #include <linux/rcupdate_trace.h>
+ #include <linux/memcontrol.h>
+ #include <linux/trace_events.h>
+-
+ #define IS_FD_ARRAY(map) ((map)->map_type == BPF_MAP_TYPE_PERF_EVENT_ARRAY || \
+ 			  (map)->map_type == BPF_MAP_TYPE_CGROUP_ARRAY || \
+ 			  (map)->map_type == BPF_MAP_TYPE_ARRAY_OF_MAPS)
+@@ -67,7 +66,88 @@ static const struct bpf_map_ops * const bpf_map_types[] = {
+ #undef BPF_MAP_TYPE
+ #undef BPF_LINK_TYPE
+ };
++#include<linux/security_bpf_helper.h>
++
++#ifdef CONFIG_BPF_MEASURE_TIME
++static unsigned long long get_time(void) {
++        unsigned long lo, hi;
++        asm( "rdtsc" : "=a" (lo), "=d" (hi) );
++        return( lo | (hi << 32) );
++}
++#endif
++
++#ifdef CONFIG_BPF_HELPER_STRICT
++static __always_inline int HelperWrite(unsigned int bits)
++{
++    return ((unsigned int)bits & BPF_PROBE_WRITE_BIT) != 0;
++}
++static __always_inline int HelperRead(unsigned int bits)
++{
++    return ((unsigned int)bits & BPF_PROBE_READ_BIT) != 0;
++}
++static __always_inline int HelperSendSignal(unsigned int bits)
++{
++    return ((unsigned int)bits & BPF_SEND_SIGNAL_BIT) != 0;
++}
++static __always_inline int HelperOverrideReturn(unsigned int bits)
++{
++    return ((unsigned int)bits & BPF_OVERRIDE_RETURN_BIT) != 0;
++}
++static __always_inline int GetMapFdById(unsigned int bits)
++{
++    return ((unsigned int)bits & BPF_GET_MAP_FD_BY_ID_BIT) != 0;
++}
++static __always_inline int MapElemUpdate(unsigned int bits)
++{
++    return ((unsigned int)bits & BPF_MAP_ELEM_UPDATE_BIT) != 0;
++}
++static __always_inline int ProgType(unsigned int bits)
++{
++    return ((unsigned int)bits & BPF_PROG_TYPE_BIT) != 0;
++}
++static __always_inline int TraceEscape(unsigned int bits)
++{
++    return ((unsigned int)bits & BPF_TRACE_NS_ESCAPE_BIT) != 0;
++}
++
++inline unsigned int get_all_helper_bit(void) {
++    unsigned int all;
++    all = (1 << BPF_PROBE_WRITE_BIT) + (1<<BPF_PROBE_READ_BIT) + (1<<BPF_SEND_SIGNAL_BIT) + (1<<BPF_OVERRIDE_RETURN_BIT) + (1<<BPF_GET_MAP_FD_BY_ID_BIT) + (1<<BPF_PROG_TYPE_BIT) + (1<<BPF_MAP_ELEM_UPDATE_BIT) + (1<<BPF_TRACE_NS_ESCAPE_BIT);
++    return all;
++}
++int bpf_set_security_helper_bits(union bpf_attr *attr) 
++{
+ 
++    int res;
++    unsigned int bits_to_set;
++    unsigned int expected_bpf_helper_bitfield = 0;
++ 
++
++    bits_to_set = attr->security_helper_bits;
++    
++    if (HelperWrite(bits_to_set))
++	expected_bpf_helper_bitfield += (1 << BPF_PROBE_WRITE_BIT);
++    if (HelperRead(bits_to_set))
++	expected_bpf_helper_bitfield += (1 << BPF_PROBE_READ_BIT);
++    if (HelperSendSignal(bits_to_set))
++	expected_bpf_helper_bitfield += (1 << BPF_SEND_SIGNAL_BIT);
++    if (HelperOverrideReturn(bits_to_set))
++	expected_bpf_helper_bitfield += (1 << BPF_OVERRIDE_RETURN_BIT);
++    if (GetMapFdById(bits_to_set))
++	expected_bpf_helper_bitfield += (1 << BPF_GET_MAP_FD_BY_ID_BIT);
++    if (ProgType(bits_to_set))
++	expected_bpf_helper_bitfield += (1 << BPF_PROG_TYPE_BIT);
++    if (MapElemUpdate(bits_to_set))
++	expected_bpf_helper_bitfield += (1 << BPF_MAP_ELEM_UPDATE_BIT);
++    if (TraceEscape(bits_to_set))
++	expected_bpf_helper_bitfield += (1 << BPF_TRACE_NS_ESCAPE_BIT);
++
++    printk(KERN_ALERT "set helper bit: %d\n",expected_bpf_helper_bitfield);
++    current->bpf_helper_bitfield = expected_bpf_helper_bitfield;
++    res = 0;
++    return res;
++}
++#endif
+ /*
+  * If we're handed a bigger struct than we know of, ensure all the unknown bits
+  * are 0 - i.e. new user-space does not rely on any kernel feature extensions
+@@ -1391,6 +1471,11 @@ static int map_update_elem(union bpf_attr *attr, bpfptr_t uattr)
+ 	struct fd f;
+ 	int err;
+ 
++#ifdef CONFIG_BPF_HELPER_STRICT
++	if (!check_bpf_bitfield(BPF_MAP_ELEM_UPDATE_BIT)) {
++	    return -EPERM;
++	}
++#endif
+ 	if (CHECK_ATTR(BPF_MAP_UPDATE_ELEM))
+ 		return -EINVAL;
+ 
+@@ -2498,6 +2583,7 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr)
+ 	if (attr->insn_cnt == 0 ||
+ 	    attr->insn_cnt > (bpf_capable() ? BPF_COMPLEXITY_LIMIT_INSNS : BPF_MAXINSNS))
+ 		return -E2BIG;
++	
+ 	if (type != BPF_PROG_TYPE_SOCKET_FILTER &&
+ 	    type != BPF_PROG_TYPE_CGROUP_SKB &&
+ 	    !bpf_capable())
+@@ -2556,6 +2642,9 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr)
+ 			btf_put(attach_btf);
+ 		return -ENOMEM;
+ 	}
++#ifdef CONFIG_BPF_HELPER_STRICT
++	prog->load_ns = task_active_pid_ns(current); 
++#endif
+ 
+ 	prog->expected_attach_type = attr->expected_attach_type;
+ 	prog->aux->attach_btf = attach_btf;
+@@ -3753,10 +3842,13 @@ static int bpf_map_get_fd_by_id(const union bpf_attr *attr)
+ 	if (CHECK_ATTR(BPF_MAP_GET_FD_BY_ID) ||
+ 	    attr->open_flags & ~BPF_OBJ_FLAG_MASK)
+ 		return -EINVAL;
+-
+ 	if (!capable(CAP_SYS_ADMIN))
+ 		return -EPERM;
+-
++#ifdef CONFIG_BPF_HELPER_STRICT
++	if (!check_bpf_bitfield(BPF_GET_MAP_FD_BY_ID_BIT)) {
++		return -EPERM;
++	}
++#endif 
+ 	f_flags = bpf_get_file_flag(attr->open_flags);
+ 	if (f_flags < 0)
+ 		return f_flags;
+@@ -4913,7 +5005,7 @@ static int __sys_bpf(int cmd, bpfptr_t uattr, unsigned int size)
+ 	union bpf_attr attr;
+ 	bool capable;
+ 	int err;
+-
++	
+ 	capable = bpf_capable() || !sysctl_unprivileged_bpf_disabled;
+ 
+ 	/* Intent here is for unprivileged_bpf_disabled to block key object
+@@ -4925,7 +5017,7 @@ static int __sys_bpf(int cmd, bpfptr_t uattr, unsigned int size)
+ 	 * and other operations.
+ 	 */
+ 	if (!capable &&
+-	    (cmd == BPF_MAP_CREATE || cmd == BPF_PROG_LOAD))
++	    (cmd == BPF_MAP_CREATE || cmd == BPF_PROG_LOAD || cmd == BPF_HELPER_BITS_SET))
+ 		return -EPERM;
+ 
+ 	err = bpf_check_uarg_tail_zero(uattr, sizeof(attr), size);
+@@ -4938,7 +5030,7 @@ static int __sys_bpf(int cmd, bpfptr_t uattr, unsigned int size)
+ 	if (copy_from_bpfptr(&attr, uattr, size) != 0)
+ 		return -EFAULT;
+ 
+-	err = security_bpf(cmd, &attr, size);
++	err = security_bpf(cmd, &attr, size);	
+ 	if (err < 0)
+ 		return err;
+ 
+@@ -5056,6 +5148,11 @@ static int __sys_bpf(int cmd, bpfptr_t uattr, unsigned int size)
+ 	case BPF_PROG_BIND_MAP:
+ 		err = bpf_prog_bind_map(&attr);
+ 		break;
++#ifdef CONFIG_BPF_HELPER_STRICT
++	case BPF_HELPER_BITS_SET:
++		err = bpf_set_security_helper_bits(&attr);
++		break;
++#endif
+ 	default:
+ 		err = -EINVAL;
+ 		break;
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 08969f5aa..dedfa2dbe 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -1977,14 +1977,6 @@ static void rv_task_fork(struct task_struct *p)
+ #define rv_task_fork(p) do {} while (0)
+ #endif
+ 
+-/*
+- * This creates a new process as a copy of the old one,
+- * but does not actually start it yet.
+- *
+- * It copies the registers, and all the appropriate
+- * parts of the process environment (as per the clone
+- * flags). The actual kick-off is left to the caller.
+- */
+ static __latent_entropy struct task_struct *copy_process(
+ 					struct pid *pid,
+ 					int trace,
+@@ -1998,6 +1990,10 @@ static __latent_entropy struct task_struct *copy_process(
+ 	const u64 clone_flags = args->flags;
+ 	struct nsproxy *nsp = current->nsproxy;
+ 
++#ifdef CONFIG_BPF_HELPER_STRICT
++	unsigned int bitfield = current->bpf_helper_bitfield;
++#endif
++
+ 	/*
+ 	 * Don't allow sharing the root directory with processes in a different
+ 	 * namespace
+@@ -2102,6 +2098,7 @@ static __latent_entropy struct task_struct *copy_process(
+ 	 */
+ 	p->clear_child_tid = (clone_flags & CLONE_CHILD_CLEARTID) ? args->child_tid : NULL;
+ 
++
+ 	ftrace_graph_init_task(p);
+ 
+ 	rt_mutex_init_task(p);
+@@ -2490,6 +2487,16 @@ static __latent_entropy struct task_struct *copy_process(
+ 
+ 	copy_oom_score_adj(clone_flags, p);
+ 
++#ifdef CONFIG_BPF_HELPER_STRICT
++	/* Only if explicit set CLONE_BITFIELD or the forked process has both CAP_BPF and CAP_SYS_ADMIN,
++	 * we will set the bitfield
++	 */
++	p->bpf_helper_bitfield = (clone_flags & CLONE_BITFIELD) ? bitfield : 0;
++	if (capable(CAP_BPF) || capable(CAP_SYS_ADMIN))
++		p->bpf_helper_bitfield = bitfield; 
++	
++//p->bpf_helper_bitfield = 510;	    // for testing
++#endif
+ 	return p;
+ 
+ bad_fork_cancel_cgroup:
+diff --git a/kernel/trace/bpf_trace.c b/kernel/trace/bpf_trace.c
+index 1ed08967f..ebfe6943b 100644
+--- a/kernel/trace/bpf_trace.c
++++ b/kernel/trace/bpf_trace.c
+@@ -39,6 +39,21 @@
+ #define bpf_event_rcu_dereference(p)					\
+ 	rcu_dereference_protected(p, lockdep_is_held(&bpf_event_mutex))
+ 
++
++static bool check_bpf_allow_trace(void) {
++    unsigned long start;
++    unsigned long end;
++    unsigned int bits;
++    int res;
++    res = true;
++    bits = current->bpf_allow_trace_bitfield;
++    if (!bits) {
++	res = false;
++    }
++    return res;
++}
++
++
+ #ifdef CONFIG_MODULES
+ struct bpf_trace_module {
+ 	struct module *module;
+@@ -103,6 +118,11 @@ unsigned int trace_call_bpf(struct trace_event_call *call, void *ctx)
+ {
+ 	unsigned int ret;
+ 
++#ifdef CONFIG_BPF_HELPER_STRICT
++	unsigned long start,end;
++	if (!check_bpf_allow_trace())
++	    goto out;
++#endif
+ 	cant_sleep();
+ 
+ 	if (unlikely(__this_cpu_inc_return(bpf_prog_active) != 1)) {
+@@ -145,6 +165,10 @@ unsigned int trace_call_bpf(struct trace_event_call *call, void *ctx)
+ #ifdef CONFIG_BPF_KPROBE_OVERRIDE
+ BPF_CALL_2(bpf_override_return, struct pt_regs *, regs, unsigned long, rc)
+ {
++#ifdef CONFIG_BPF_HELPER_STRICT
++	if (unlikely(!check_bpf_bitfield(BPF_OVERRIDE_RETURN_BIT)))
++	    return -EPERM;
++#endif
+ 	regs_set_return_value(regs, rc);
+ 	override_function_with_return(regs);
+ 	return 0;
+@@ -162,8 +186,8 @@ static const struct bpf_func_proto bpf_override_return_proto = {
+ static __always_inline int
+ bpf_probe_read_user_common(void *dst, u32 size, const void __user *unsafe_ptr)
+ {
+-	int ret;
+ 
++	int ret;
+ 	ret = copy_from_user_nofault(dst, unsafe_ptr, size);
+ 	if (unlikely(ret < 0))
+ 		memset(dst, 0, size);
+@@ -287,6 +311,10 @@ const struct bpf_func_proto bpf_probe_read_kernel_str_proto = {
+ BPF_CALL_3(bpf_probe_read_compat, void *, dst, u32, size,
+ 	   const void *, unsafe_ptr)
+ {
++#ifdef CONFIG_BPF_HELPER_STRICT
++	if (unlikely(!check_bpf_bitfield(BPF_PROBE_READ_BIT)))
++	    return -EPERM;
++#endif
+ 	if ((unsigned long)unsafe_ptr < TASK_SIZE) {
+ 		return bpf_probe_read_user_common(dst, size,
+ 				(__force void __user *)unsafe_ptr);
+@@ -338,7 +366,10 @@ BPF_CALL_3(bpf_probe_write_user, void __user *, unsafe_ptr, const void *, src,
+ 	 * state, when the task or mm are switched. This is specifically
+ 	 * required to prevent the use of temporary mm.
+ 	 */
+-
++#ifdef CONFIG_BPF_HELPER_STRICT
++	if (unlikely(!check_bpf_bitfield(BPF_PROBE_WRITE_BIT)))	
++		return -EPERM;
++#endif
+ 	if (unlikely(in_interrupt() ||
+ 		     current->flags & (PF_KTHREAD | PF_EXITING)))
+ 		return -EPERM;
+@@ -843,6 +874,10 @@ static int bpf_send_signal_common(u32 sig, enum pid_type type)
+ 	 * permitted in order to send signal to the current
+ 	 * task.
+ 	 */
++#ifdef CONFIG_BPF_HELPER_STRICT
++	if (unlikely(!check_bpf_bitfield(BPF_SEND_SIGNAL_BIT)))
++		return -EPERM;
++#endif 
+ 	if (unlikely(current->flags & (PF_KTHREAD | PF_EXITING)))
+ 		return -EPERM;
+ 	if (unlikely(!nmi_uaccess_okay()))
+@@ -2245,6 +2280,18 @@ void bpf_put_raw_tracepoint(struct bpf_raw_event_map *btp)
+ static __always_inline
+ void __bpf_trace_run(struct bpf_prog *prog, u64 *args)
+ {
++#ifdef CONFIG_BPF_HELPER_STRICT
++	//unsigned long start,end;
++	bool bit;
++	struct pid_namespace *ns;
++	if (!check_bpf_allow_trace()) {
++	    goto out;
++	}
++	ns = task_active_pid_ns(current);	
++	bit = (!check_bpf_bitfield(BPF_TRACE_NS_ESCAPE_BIT) && ns != prog->load_ns);
++	if (bit)
++	    goto out;
++#endif
+ 	cant_sleep();
+ 	if (unlikely(this_cpu_inc_return(*(prog->active)) != 1)) {
+ 		bpf_prog_inc_misses_counter(prog);
+@@ -2256,7 +2303,6 @@ void __bpf_trace_run(struct bpf_prog *prog, u64 *args)
+ out:
+ 	this_cpu_dec(*(prog->active));
+ }
+-
+ #define UNPACK(...)			__VA_ARGS__
+ #define REPEAT_1(FN, DL, X, ...)	FN(X)
+ #define REPEAT_2(FN, DL, X, ...)	FN(X) UNPACK DL REPEAT_1(FN, DL, __VA_ARGS__)
+-- 
+2.25.1
+

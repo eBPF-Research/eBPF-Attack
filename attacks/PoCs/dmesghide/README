@@ -1,0 +1,22 @@
+```strace -o ./log -e trace=openat,syslog -f dmesg```  
+
+The dmesg will first check if "/dev/kmsg" exists, and if it doesn't, dmesg will try to use syslog(SYSLOG_ACTION_SIZE_BUFFER) and syslog(SYSLOG_ACTION_READ_ALL,user_buffer, length) to read log.  
+
+We first override the return value of openat to -1, to make sure dmesg enter syslog() branch.  
+
+In syslog() instance, we override the length of log by override_return, so that hide the log.  
+
+Result:
+
+```bash
+# hide log
+┌─[root@VM-16-10-ubuntu]─[~]
+└──╼ #dmesg
+┌─[root@VM-16-10-ubuntu]─[~]
+└──╼ #docker exec -it a8b73b96983f bash
+root@a8b73b96983f:/# dmesg
+root@a8b73b96983f:/# exit
+exit
+┌─[root@VM-16-10-ubuntu]─[~]
+└──╼ #
+```

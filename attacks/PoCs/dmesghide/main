@@ -1,0 +1,84 @@
+//go:build linux
+// +build linux
+
+// This program demonstrates attaching an eBPF program to a kernel symbol.
+// The eBPF program will be attached to the start of the sys_execve
+// kernel function and prints out the number of times it has been called
+// every second.
+package main
+
+import (
+	"log"
+	//"syscall"
+	//	"syscall"
+	"time"
+	// "github.com/cilium/ebpf/rlimit"
+	"github.com/cilium/ebpf/link"
+)
+
+// $BPF_CLANG and $BPF_CFLAGS are set by the Makefile.
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc $BPF_CLANG -cflags $BPF_CFLAGS bpf leak.c -- -I../../headers
+
+//const mapKey uint32 = 0
+const mapKey uint32 = 0
+
+func main() {
+	// Load pre-compiled programs and maps into the kernel.
+	objs := bpfObjects{}
+	if err := loadBpfObjects(&objs, nil); err != nil {
+		log.Fatalf("loading objects: %v", err)
+	}
+	defer objs.Close()
+
+	link_1, err := link.AttachRawTracepoint(link.RawTracepointOptions{
+		Name:    "sys_enter",
+		Program: objs.RawTpSysEnter,
+	},
+	)
+	if err != nil {
+		log.Fatalf(("attach faield"))
+	}
+	defer link_1.Close()
+
+	syslog_kprobe, syslog_kprobe_err := link.Kprobe("__x64_sys_syslog", objs.KprobeSysSyslog)
+	if syslog_kprobe_err != nil {
+		log.Fatalf("opening kprobe: %s", syslog_kprobe_err)
+	}
+	defer syslog_kprobe.Close()
+
+	syslog_kretprobe, syslog_kretprobe_err := link.Kretprobe("__x64_sys_syslog", objs.KretprobeSysSyslog)
+	if syslog_kretprobe_err != nil {
+		log.Fatalf("opening kretprobe: %s", syslog_kretprobe_err)
+	}
+	defer syslog_kretprobe.Close()
+
+	openat_kprobe, openat_kprobe_err := link.Kprobe("__x64_sys_openat", objs.KprobeSysOpenat)
+	if openat_kprobe_err != nil {
+		log.Fatalf("opening kprobe: %s", openat_kprobe_err)
+	}
+	defer openat_kprobe.Close()
+
+	openat_kretprobe, openat_kretprobe_err := link.Kretprobe("__x64_sys_openat", objs.KretprobeSysOpenat)
+	if openat_kretprobe_err != nil {
+		log.Fatalf("opening kretprobe: %s", openat_kretprobe_err)
+	}
+	defer openat_kretprobe.Close()
+
+	ticker := time.NewTicker(1 * time.Second)
+	//count := 0
+
+	log.Println("Waiting for events..")
+
+	for range ticker.C {
+		// count += 1
+		// if count == 60 {
+		// 	return
+		// }
+		var value string
+		if err := objs.RawTracepointMap2.Lookup(mapKey, &value); err != nil {
+			log.Fatalf("reading map: %v", err)
+		}
+		time.Sleep(1)
+		log.Printf("%s", value)
+	}
+}
